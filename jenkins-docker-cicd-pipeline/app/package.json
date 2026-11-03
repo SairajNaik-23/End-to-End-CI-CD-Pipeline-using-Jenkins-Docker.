@@ -1,0 +1,16 @@
+{
+  "name": "jenkins-docker-demo-app",
+  "version": "1.0.0",
+  "description": "Demo app for the Jenkins + Docker CI/CD pipeline",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js",
+    "test": "node --test"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "express": "^4.21.1"
+  }
+}

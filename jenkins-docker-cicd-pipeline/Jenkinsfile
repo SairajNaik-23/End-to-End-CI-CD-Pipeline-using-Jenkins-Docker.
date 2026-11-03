@@ -1,0 +1,110 @@
+// CI/CD: GitHub push -> Jenkins (webhook) -> Test -> Build image -> Push to Docker Hub -> Deploy to EC2
+//
+// Jenkins credentials needed (Manage Jenkins -> Credentials):
+//   dockerhub-creds : Username + Password (Docker Hub access token)
+//   deploy-ssh-key  : SSH Username with private key (user "ubuntu" on the deploy server)
+
+pipeline {
+    agent any
+
+    environment {
+        DOCKERHUB_REPO = 'your-dockerhub-username/jenkins-docker-demo'   // <-- change
+        DEPLOY_HOST    = 'ubuntu@<DEPLOY_SERVER_PUBLIC_IP>'               // <-- change
+        CONTAINER_NAME = 'demo-app'
+        APP_PORT       = '80'
+    }
+
+    triggers {
+        githubPush()   // started by the GitHub webhook
+    }
+
+    options {
+        timestamps()
+        disableConcurrentBuilds()
+        buildDiscarder(logRotator(numToKeepStr: '15'))
+    }
+
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+                script {
+                    env.GIT_SHORT = sh(script: 'git rev-parse --short HEAD', returnStdout: true).trim()
+                    env.IMAGE_TAG = "${env.BUILD_NUMBER}-${env.GIT_SHORT}"
+                }
+                echo "Building image tag ${IMAGE_TAG}"
+            }
+        }
+
+        stage('Install & Test') {
+            steps {
+                // Run tests inside a throwaway Node container -> no Node needed on Jenkins
+                sh '''
+                    docker run --rm -u "$(id -u):$(id -g)" -e HOME=/tmp \
+                      -v "$PWD/app":/app -w /app node:20-alpine \
+                      sh -c "npm install && npm test"
+                '''
+            }
+        }
+
+        stage('Build Image') {
+            steps {
+                sh 'docker build -t ${DOCKERHUB_REPO}:${IMAGE_TAG} -t ${DOCKERHUB_REPO}:latest app/'
+            }
+        }
+
+        stage('Push to Docker Hub') {
+            steps {
+                withCredentials([usernamePassword(credentialsId: 'dockerhub-creds',
+                                                  usernameVariable: 'DH_USER',
+                                                  passwordVariable: 'DH_TOKEN')]) {
+                    sh '''
+                        echo "$DH_TOKEN" | docker login -u "$DH_USER" --password-stdin
+                        docker push ${DOCKERHUB_REPO}:${IMAGE_TAG}
+                        docker push ${DOCKERHUB_REPO}:latest
+                        docker logout
+                    '''
+                }
+            }
+        }
+
+        stage('Deploy to EC2') {
+            steps {
+                sshagent(credentials: ['deploy-ssh-key']) {
+                    // Run scripts/deploy.sh on the remote server
+                    sh '''
+                        ssh -o StrictHostKeyChecking=no ${DEPLOY_HOST} \
+                          "bash -s" -- ${DOCKERHUB_REPO}:${IMAGE_TAG} ${CONTAINER_NAME} ${APP_PORT} \
+                          < scripts/deploy.sh
+                    '''
+                }
+            }
+        }
+
+        stage('Smoke Test') {
+            steps {
+                script {
+                    def host = env.DEPLOY_HOST.split('@')[1]
+                    // Retry for up to 60s until /health answers
+                    retry(6) {
+                        sleep 10
+                        sh "curl -fsS http://${host}:${APP_PORT}/health"
+                    }
+                }
+            }
+        }
+    }
+
+    post {
+        success {
+            echo "Deployed ${DOCKERHUB_REPO}:${IMAGE_TAG}"
+        }
+        failure {
+            echo 'Build failed - check the stage logs above.'
+        }
+        always {
+            // Remove local images so the Jenkins disk doesn't fill up
+            sh 'docker rmi ${DOCKERHUB_REPO}:${IMAGE_TAG} ${DOCKERHUB_REPO}:latest || true'
+        }
+    }
+}
